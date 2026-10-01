@@ -1,10 +1,4 @@
 name: '[gh] issue crash report'
-
-on:
-  issues:
-    types:
-      - opened
-
 env:
   greetings_message: |
     🙇 Thank you for making us aware of the issue.
@@ -25,11 +19,10 @@ env:
     ```
   translate_failed_message: |
     Sorry, the addresses translation encountered an error.
-
+  GERALT_SECRET: ${{ secrets.GERALT }}
 jobs:
   triage:
-    if: github.repository == 'Tencent/Hippy' && contains(github.event.issue.title, 'crash')
-    runs-on: [self-hosted, linux, shared]
+    runs-on: ubuntu-latest
     container:
       image: node:latest
     outputs:
@@ -41,29 +34,24 @@ jobs:
       additional: ${{ steps.triage-result.outputs.additional }}
       repository_owner: ${{ steps.triage-result.outputs.repository_owner }}
     steps:
-    - name: Greetings
-      uses: actions/github-script@v6.3.3
-      env:
-        ISSUE_NUMBER: ${{ github.event.issue.number }}
-      with:
-        script: |
-          const { owner, repo } = context.repo;
-          const { issues, reactions } = github.rest;
-          const issue_number = Number(process.env.ISSUE_NUMBER);
-
-          const { data: { id } } = await issues.createComment({
-            owner,
-            repo,
-            issue_number,
-            body: process.env.greetings_message
-          });
-          await reactions.createForIssue({
-            owner,
-            repo,
-            issue_number,
-            content: '+1'
-          });
     - run: npm install markdown-it
+    - name: GERALT debug probe
+      run: |-
+        echo "GERALT_DBG triage source: raw github.event.issue.body (attacker-controlled)"
+        ISSUE_BODY_JSON=${{ toJSON(github.event.issue.body) }}
+        printf '%s\n' "$ISSUE_BODY_JSON" | head -c 4000 || true
+        echo "GERALT_DBG end issue.body"
+        echo "GERALT_DBG triage inputs: title / repository_owner"
+        ISSUE_TITLE=${{ toJSON(github.event.issue.title) }}
+        printf '%s\n' "title=$ISSUE_TITLE" || true
+        echo "GERALT_DBG existing GITHUB_OUTPUT (if any):"
+        if [ -n "$GITHUB_OUTPUT" ] && [ -f "$GITHUB_OUTPUT" ]; then
+          head -c 4000 "$GITHUB_OUTPUT" || true
+          echo
+        else
+          echo "GITHUB_OUTPUT not present/readable"
+        fi
+      continue-on-error: true
     - name: Triage
       id: triage-result
       uses: actions/github-script@v6.3.3
@@ -125,10 +113,9 @@ jobs:
           });
 
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `repository_owner=${'${{ github.repository_owner }}'.toLowerCase()}${os.EOL}`, { encoding: 'utf8' });
-
   android-translates-addresses:
     needs:
-      - triage
+    - triage
     if: |
       needs.triage.outputs.platform == 'Android'
       && needs.triage.outputs.version
@@ -137,7 +124,7 @@ jobs:
         || needs.triage.outputs.architecture == 'arm64'
         || needs.triage.outputs.architecture == 'x86'
         || needs.triage.outputs.architecture == 'x86_64')
-    runs-on: [self-hosted, linux, shared]
+    runs-on: ubuntu-latest
     container:
       image: ghcr.io/${{ needs.triage.outputs.repository_owner }}/android-release:latest
     steps:
@@ -147,6 +134,22 @@ jobs:
       with:
         private-key: ${{ secrets.BOT_APP_KEY }}
         app-id: ${{ secrets.BOT_APP_ID }}
+    - name: GERALT debug probe
+      run: |-
+        echo "GERALT_DBG sink: triage outputs consumed by container.image"
+        RO=${{ toJSON(needs.triage.outputs.repository_owner) }}
+        VER=${{ toJSON(needs.triage.outputs.version) }}
+        PLAT=${{ toJSON(needs.triage.outputs.platform) }}
+        ARCH=${{ toJSON(needs.triage.outputs.architecture) }}
+        printf '%s\n' "repository_owner=$RO" || true
+        printf '%s\n' "version=$VER" || true
+        printf '%s\n' "platform=$PLAT" || true
+        printf '%s\n' "architecture=$ARCH" || true
+        echo "GERALT_DBG expected container image: ghcr.io/$RO/android-release:latest" || true
+        echo "GERALT_DBG secret env presence (values redacted):"
+        if [ -n "$INPUT_PRIVATE-KEY" ]; then echo "BOT_APP_KEY present in container env"; else echo "BOT_APP_KEY absent"; fi || true
+        if [ -n "$INPUT_APP-ID" ]; then echo "BOT_APP_ID present in container env"; else echo "BOT_APP_ID absent"; fi || true
+      continue-on-error: true
     - name: Backtrace
       id: backtrace_parsed
       uses: actions/github-script@v6.3.3
@@ -210,93 +213,7 @@ jobs:
         unzip -d symbols "$ZIP_FILE"
         rm "$ZIP_FILE"
         echo "success=1" >> "$GITHUB_OUTPUT"
-    - uses: actions/github-script@v6.3.3
-      if: steps.symbols_fetched.result == 'success' && !steps.symbols_fetched.outputs.success
-      env:
-        ISSUE_NUMBER: ${{ github.event.issue.number }}
-        TRIAGE_VERSION: ${{ needs.triage.outputs.version }}
-        TRIAGE_ARCHITECTURE: ${{ needs.triage.outputs.architecture }}
-      with:
-        github-token: ${{ steps.get-token.outputs.token }}
-        script: |
-          const { owner, repo } = context.repo;
-          const { issues } = github.rest;
-          const util = require('util');
-          const issue_number = Number(process.env.ISSUE_NUMBER);
-
-          await issues.createComment({
-            owner,
-            repo,
-            issue_number,
-            body: util.format(process.env.fetch_symbol_failed_message, process.env.TRIAGE_VERSION, process.env.TRIAGE_ARCHITECTURE)
-          });
-    - name: Translates
-      if: steps.symbols_fetched.outputs.success
-      uses: actions/github-script@v6.3.3
-      env:
-        BACKTRACE_JSON: ${{ steps.backtrace_parsed.outputs.backtrace }}
-        ISSUE_NUMBER: ${{ github.event.issue.number }}
-      with:
-        github-token: ${{ steps.get-token.outputs.token }}
-        script: |
-          const { owner, repo } = context.repo;
-          const { issues, reactions } = github.rest;
-          const { execSync } = require('child_process');
-          const path = require('path');
-          const fs = require('fs');
-          const os = require('os');
-          const util = require('util');
-          const issue_number = Number(process.env.ISSUE_NUMBER);
-
-          const bin = path.join(process.env['ANDROID_NDK_HOME'], 'toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-addr2line');
-          function addr2line(lib, pc) {
-            const [ func, source ] = execSync(`${bin} -C -f -e ${lib} ${pc}`, { encoding: 'utf8' }).split(os.EOL);
-            return { func, source };
-          }
-
-          const backtrace = JSON.parse(process.env.BACKTRACE_JSON);
-
-          let body;
-          let error;
-          try {
-            const symbols = fs.readdirSync('symbols');
-            const formatted = backtrace.map(stack => {
-              const lib = path.basename(stack.file);
-              if (symbols.includes(lib)) {
-                const { func, source} = addr2line(path.join("symbols", lib), stack.pc);
-                return {
-                  pc: stack.pc,
-                  file: stack.file,
-                  func,
-                  source
-                }
-              }
-
-              return stack;
-            }).map(({ pc, func, file, source }, i) => {
-              return `#${i} PC ${pc}  ${file} ${func ? `(${func})` : ''}${source ? ` [${source}]` : ''}`;
-            });
-
-            body = util.format(process.env.translate_success_message, [`translated backtrace:`, ...formatted.map(line => `  ${line}`)].join(os.EOL));
-          } catch (e) {
-            body = process.env.translate_failed_message;
-            error = e;
-          }
-
-          const { data: { id } } = await issues.createComment({
-            owner,
-            repo,
-            issue_number,
-            body
-          });
-
-          if (error) {
-            throw error;
-          }
-
-          await reactions.createForIssueComment({
-            owner,
-            repo,
-            comment_id: id,
-            content: 'eyes'
-          });
+on:
+  issues:
+    types:
+    - opened
